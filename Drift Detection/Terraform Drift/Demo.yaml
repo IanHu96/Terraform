@@ -1,0 +1,113 @@
+image:
+  name: hashicorp/terraform:light
+  entrypoint:
+    - '/usr/bin/env'
+    - 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+
+# Default output file for Terraform plan
+variables:
+  TF_IN_AUTOMATION: "true"
+  PLAN: plan.tfplan
+  JSON_PLAN_FILE: tfplan.json
+
+cache:
+  key: "$CI_COMMIT_REF_SLUG"
+  paths:
+    - .terraform
+
+.gitlab-tf-backend: &gitlab-tf-backend
+  - export TF_ADDRESS=${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/terraform/state/production
+  - export TF_HTTP_ADDRESS=${TF_ADDRESS}
+  - export TF_HTTP_LOCK_ADDRESS=${TF_ADDRESS}/lock
+  - export TF_HTTP_LOCK_METHOD=POST
+  - export TF_HTTP_UNLOCK_ADDRESS=${TF_ADDRESS}/lock
+  - export TF_HTTP_UNLOCK_METHOD=DELETE
+  - export TF_HTTP_USERNAME=gitlab-ci-token
+  - export TF_HTTP_PASSWORD=${CI_JOB_TOKEN}
+  - export TF_HTTP_RETRY_WAIT_MIN=5
+  - echo "Using HTTP Backend at $TF_HTTP_ADDRESS"
+  - terraform --version
+  - terraform init -reconfigure
+
+before_script:
+  - apk add --update curl jq
+  - alias convert_report="jq -r '([.resource_changes[].change.actions?]|flatten)|{\"create\":(map(select(.==\"create\"))|length),\"update\":(map(select(.==\"update\"))|length),\"delete\":(map(select(.==\"delete\"))|length)}'"
+  - *gitlab-tf-backend
+
+stages:
+  - validate
+  - plan
+  - apply
+
+validate:
+  stage: validate
+  script:
+    - terraform validate
+    - terraform fmt -check=true
+  only:
+    - branches
+
+merge review:
+  stage: plan
+  script:
+    - terraform plan -out=$PLAN
+    - "terraform show --json $PLAN | convert_report > $JSON_PLAN_FILE"
+  artifacts:
+    reports:
+        terraform: $JSON_PLAN_FILE
+  only:
+    - merge_requests
+  except:
+    - schedules
+
+plan production:
+  stage: plan
+  script:
+    - terraform plan -out=$PLAN
+    - "terraform show --json $PLAN | convert_report > $JSON_PLAN_FILE"
+  artifacts:
+    reports:
+        terraform: $JSON_PLAN_FILE
+  only:
+    - master
+  except:
+    - schedules
+  resource_group: production
+
+apply:
+  stage: apply
+  script:
+    - terraform apply -auto-approve
+  dependencies:
+    - plan production
+  only:
+    - master
+  except:
+    - schedules
+  resource_group: production
+
+drift:
+  stage: plan
+  script:
+    - terraform plan -detailed-exitcode -out=$PLAN 2> /dev/null || ec=$?
+    - |
+      case $ec in
+        0) echo "No Changes Found"; exit 0;;
+        1) printf '%s\n' "Command exited with non-zero"; exit 1;;
+        2) echo "Changes Found, opening Issue"; 
+           echo \`\`\`diff > $PLAN; 
+           terraform show -no-color ${PLAN} | tee -a $PLAN; 
+           echo \`\`\` >> $PLAN; 
+           sed -i -e 's/  +/+/g' $PLAN; 
+           sed -i -e 's/  ~/~/g' $PLAN; 
+           sed -i -e 's/  -/-/g' $PLAN; 
+           MESSAGE=$(cat $PLAN); 
+           curl -X POST -g -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
+           --data-urlencode "title=Drift has been detected" \
+           --data-urlencode "description=${MESSAGE}" \
+           "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/issues";;
+      esac
+only:
+    - schedules
+  resource_group: production
+

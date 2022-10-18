@@ -1,0 +1,12 @@
+ - task: DownloadSecureFile@1
+    name: azurepoc
+    displayName: 'Download certificate'
+    inputs:
+      secureFile: 'azurepoc.pem'
+  - script: |
+      echo Installing $(azurepoc.secureFilePath) to the trusted CA directory...
+      sudo chown root:root $(azurepoc.secureFilePath)
+      sudo chmod a+r $(azurepoc.secureFilePath)
+      sudo ln -s -t /etc/ssl/certs/ $(azurepoc.secureFilePath)
+  - script: |
+      scp $(Build.ArtifactStagingDirectory)/$(Build.BuildId).zip azurepoc@20.205.189.113:/home/azurepoc
